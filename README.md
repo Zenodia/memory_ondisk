@@ -194,13 +194,28 @@ See `GREP_EXAMPLES.md` for more search patterns.
 
 ## 🧪 Testing
 
-### Run All Tests
+### Run Non-Blocking Tests (Recommended)
+
+```bash
+python test_nonblocking.py
+```
+
+**Focused tests for non-blocking functionality:**
+- TEST 1: Blocking mode performance
+- TEST 2: Non-blocking mode performance  
+- TEST 3: Summary interval validation
+- TEST 4: Background task management
+- TEST 5: No-summary mode (high interval)
+
+**Shows:** Performance comparison, speedup metrics, interval validation
+
+### Run Full Memory System Tests
 
 ```bash
 python test_memory_system.py
 ```
 
-**Tests included:**
+**Comprehensive tests:**
 - TEST 0: Blocking vs Non-blocking comparison (5 turns)
 - TEST 1: Create 100 turns with background summaries
 - TEST 2: Grep/glob/sed search validation
@@ -211,7 +226,7 @@ python test_memory_system.py
 python demo_nonblocking.py
 ```
 
-Shows:
+**Interactive demonstration:**
 - Performance comparison (blocking vs non-blocking)
 - Real-time conversation with background tasks
 - API usage examples

@@ -4,3 +4,8 @@ __pycache__/
 .ipynb_checkpoints/
 test_memory_blocking/
 test_memory_nonblocking/
+test_nonblocking_output/
+test_blocking_output/
+test_tasks_output/
+test_no_summary_output/
+test_interval_output/
