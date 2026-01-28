@@ -104,7 +104,8 @@ class MemoryHandler:
         llm: ChatNVIDIA = None,
         memory_dir: str = None,
         use_streaming: bool = False,
-        rate_limit_delay: float = 2.0  # Delay between LLM calls to avoid rate limits
+        rate_limit_delay: float = 2.0,  # Delay between LLM calls to avoid rate limits
+        summary_interval: int = 10  # Create summaries every N turns
     ):
         """
         Initialize the Enhanced Memory Handler.
@@ -114,6 +115,8 @@ class MemoryHandler:
             llm: ChatNVIDIA instance for LLM operations
             memory_dir: Directory to store memory files
             use_streaming: Whether to use streaming for LLM responses
+            rate_limit_delay: Seconds to wait between LLM calls (default 2.0)
+            summary_interval: Create summaries every N turns (default 10)
         """
         self.username = username
         self.user_id = username  # Alias for compatibility
@@ -124,6 +127,8 @@ class MemoryHandler:
         self.rate_limit_delay = rate_limit_delay
         self.last_llm_call_time = 0  # Track last LLM call for rate limiting
         self.turn_counter = 0  # Track conversation turns
+        self.background_tasks = []  # Track background summarization tasks
+        self.summary_interval = summary_interval  # Create summaries every N turns
         
         # Set up memory directory
         if memory_dir is None:
@@ -206,6 +211,67 @@ Your summary:
                 wait_time = self.rate_limit_delay - elapsed
                 print(Fore.YELLOW + f"Rate limiting: waiting {wait_time:.1f}s...", Fore.RESET)
                 await asyncio.sleep(wait_time)
+    
+    def cleanup_background_tasks(self):
+        """Remove completed background tasks from tracking list."""
+        self.background_tasks = [task for task in self.background_tasks if not task.done()]
+    
+    async def wait_for_background_tasks(self, timeout: float = None):
+        """
+        Wait for all background summarization tasks to complete.
+        
+        Args:
+            timeout: Maximum time to wait in seconds (None = wait indefinitely)
+        """
+        if not self.background_tasks:
+            return
+        
+        print(Fore.CYAN + f"Waiting for {len(self.background_tasks)} background tasks...", Fore.RESET)
+        
+        try:
+            if timeout:
+                await asyncio.wait_for(
+                    asyncio.gather(*self.background_tasks, return_exceptions=True),
+                    timeout=timeout
+                )
+            else:
+                await asyncio.gather(*self.background_tasks, return_exceptions=True)
+            
+            print(Fore.GREEN + "✓ All background tasks completed", Fore.RESET)
+        except asyncio.TimeoutError:
+            print(Fore.YELLOW + f"Warning: Some background tasks timed out after {timeout}s", Fore.RESET)
+        finally:
+            self.cleanup_background_tasks()
+    
+    async def _background_summarize_and_update(
+        self,
+        turn_number: int,
+        content: str,
+        period_type: PeriodType,
+        existing_memory: str
+    ):
+        """
+        Background task: Create summary and update interaction.
+        
+        Args:
+            turn_number: Turn number to update
+            content: Content to summarize
+            period_type: Period type for summary
+            existing_memory: Existing memory context
+        """
+        try:
+            # Create the summary
+            summary = await self.create_memory_summary(
+                content=content,
+                period_type=period_type,
+                existing_memory=existing_memory
+            )
+            
+            # Update the interaction with the summary
+            if summary:
+                self.update_interaction_summary(turn_number, summary)
+        except Exception as e:
+            print(Fore.RED + f"Error in background summarization for turn {turn_number}: {e}", Fore.RESET)
     
     async def create_memory_summary(
         self, 
@@ -302,6 +368,28 @@ Your summary:
         self.save_memory_to_file()
         
         return interaction
+    
+    def update_interaction_summary(self, turn_number: int, summary: str) -> bool:
+        """
+        Update the summary for an existing interaction (called by background task).
+        
+        Args:
+            turn_number: Turn number to update
+            summary: New summary text
+            
+        Returns:
+            True if updated successfully
+        """
+        for interaction in self._all_interactions:
+            if interaction['turn'] == turn_number:
+                interaction['summary'] = summary
+                print(Fore.LIGHTMAGENTA_EX + f"✓ Updated summary for turn #{turn_number} (background)", Fore.RESET)
+                # Save to file with updated summary
+                self.save_memory_to_file()
+                return True
+        
+        print(Fore.YELLOW + f"Warning: Could not find turn #{turn_number} to update", Fore.RESET)
+        return False
     
     def search_text_file(self, pattern: str, case_sensitive: bool = False) -> List[str]:
         """
@@ -566,7 +654,8 @@ class MemoryOps:
         llm: ChatNVIDIA = None,
         memory_dir: str = None,
         use_streaming: bool = False,
-        rate_limit_delay: float = 2.0  # Delay between LLM calls
+        rate_limit_delay: float = 2.0,  # Delay between LLM calls
+        summary_interval: int = 10  # Create summaries every N turns
     ):
         """
         Initialize Text-Based Memory Operations.
@@ -577,9 +666,10 @@ class MemoryOps:
             memory_dir: Directory for memory files
             use_streaming: Whether to use streaming
             rate_limit_delay: Seconds to wait between LLM calls (default 2.0)
+            summary_interval: Create summaries every N turns (default 10)
         """
         self.username = username
-        self.memory_manager = MemoryHandler(username, llm, memory_dir, use_streaming, rate_limit_delay)
+        self.memory_manager = MemoryHandler(username, llm, memory_dir, use_streaming, rate_limit_delay, summary_interval)
         self.chat_history: List[BaseMessage] = []
         self.number_of_turns = 3
         
@@ -591,6 +681,7 @@ class MemoryOps:
         
         print(Fore.GREEN + f"✓ Text-Based Memory Operations initialized for user: {username}", Fore.RESET)
         print(Fore.CYAN + f"  Rate limit delay: {rate_limit_delay}s between LLM calls", Fore.RESET)
+        print(Fore.CYAN + f"  Summary interval: Every {summary_interval} turns", Fore.RESET)
     
     def check_turns(self) -> int:
         """Count user message turns in chat history."""
@@ -696,16 +787,19 @@ Your summary:
         message: str,
         bot_response: str,
         context: Optional[Dict[str, Any]] = None,
-        create_summary: bool = True
+        create_summary: bool = True,
+        background_summary: bool = True
     ) -> Dict[str, Any]:
         """
         Process a message exchange and save to text file.
+        Summaries are only created every N turns (configured by summary_interval).
         
         Args:
             message: User message
             bot_response: Assistant response
             context: Optional context information
             create_summary: Whether to create an LLM summary (default True)
+            background_summary: Whether to create summary in background (default True)
             
         Returns:
             Dictionary with memory operation results
@@ -718,23 +812,65 @@ Your summary:
         self.memory_manager.turn_counter += 1
         current_turn = self.memory_manager.turn_counter
         
-        # Create interaction summary if requested
-        interaction_summary = ""
-        if create_summary:
-            interaction_content = f"User: {message}\nAssistant: {bot_response}"
-            interaction_summary = await self.memory_manager.create_memory_summary(
-                content=interaction_content,
-                period_type=PeriodType.DIRECT,
-                existing_memory=self.memory_manager.summary
-            )
-        
-        # Add interaction to memory (saves to text file)
+        # Add interaction to memory immediately (without summary - non-blocking!)
         interaction = self.memory_manager.add_interaction(
             user_msg=message,
             bot_msg=bot_response,
             turn_number=current_turn,
-            summary=interaction_summary
+            summary=""  # Will be updated by background task if this is a summary turn
         )
+        
+        # Create interaction summary ONLY every N turns (configured interval)
+        interaction_summary = ""
+        should_create_summary = create_summary and (current_turn % self.memory_manager.summary_interval == 0)
+        
+        if should_create_summary:
+            # Get the last N turns since the last summary
+            start_turn = max(1, current_turn - self.memory_manager.summary_interval + 1)
+            recent_interactions = [
+                inter for inter in self.memory_manager._all_interactions 
+                if start_turn <= inter['turn'] <= current_turn
+            ]
+            
+            # Build content from multiple turns
+            interaction_content_parts = []
+            for inter in recent_interactions:
+                interaction_content_parts.append(f"Turn {inter['turn']}:")
+                interaction_content_parts.append(f"User: {inter['user_message']}")
+                interaction_content_parts.append(f"Assistant: {inter['bot_message']}")
+                interaction_content_parts.append("")
+            
+            interaction_content = "\n".join(interaction_content_parts)
+            
+            if background_summary:
+                # Launch background task to create summary (NON-BLOCKING!)
+                task = asyncio.create_task(
+                    self.memory_manager._background_summarize_and_update(
+                        turn_number=current_turn,
+                        content=interaction_content,
+                        period_type=PeriodType.DIRECT,
+                        existing_memory=self.memory_manager.summary
+                    )
+                )
+                self.memory_manager.background_tasks.append(task)
+                print(Fore.LIGHTCYAN_EX + f"🔄 Summary for turns {start_turn}-{current_turn} running in background...", Fore.RESET)
+                interaction_summary = f"[Summary pending for turns {start_turn}-{current_turn}]"
+            else:
+                # Blocking mode (original behavior)
+                interaction_summary = await self.memory_manager.create_memory_summary(
+                    content=interaction_content,
+                    period_type=PeriodType.DIRECT,
+                    existing_memory=self.memory_manager.summary
+                )
+                # Update interaction with summary
+                self.memory_manager.update_interaction_summary(current_turn, interaction_summary)
+        else:
+            # Not a summary turn
+            next_summary_turn = ((current_turn // self.memory_manager.summary_interval) + 1) * self.memory_manager.summary_interval
+            interaction_summary = f"[No summary - next summary at turn {next_summary_turn}]"
+        
+        # Cleanup completed background tasks
+        self.memory_manager.cleanup_background_tasks()
         
         # Check if we need to summarize (uses LangChain LLM internally)
         turns = self.check_turns()
@@ -746,7 +882,9 @@ Your summary:
             "interaction": interaction,
             "summary": interaction_summary,
             "total_turns": turns,
-            "overall_summary": self.summary
+            "overall_summary": self.summary,
+            "background_tasks": len(self.memory_manager.background_tasks),
+            "is_summary_turn": should_create_summary
         }
     
     def get_memory_context(self, query: str) -> str:
@@ -790,6 +928,25 @@ Your summary:
             List of matching lines
         """
         return self.memory_manager.search_text_file(pattern, case_sensitive)
+    
+    async def wait_for_summaries(self, timeout: float = None):
+        """
+        Wait for all background summary tasks to complete.
+        
+        Args:
+            timeout: Maximum time to wait in seconds (None = wait indefinitely)
+        """
+        await self.memory_manager.wait_for_background_tasks(timeout)
+    
+    def get_pending_summaries_count(self) -> int:
+        """
+        Get the number of background summary tasks still running.
+        
+        Returns:
+            Number of pending background tasks
+        """
+        self.memory_manager.cleanup_background_tasks()
+        return len(self.memory_manager.background_tasks)
 
 
 # Singleton instance cache
@@ -801,7 +958,8 @@ def get_memory_ops(
     llm: ChatNVIDIA = None,
     memory_dir: str = None,
     use_streaming: bool = False,
-    rate_limit_delay: float = 2.0
+    rate_limit_delay: float = 2.0,
+    summary_interval: int = 10
 ) -> MemoryOps:
     """
     Get or create a text-based MemoryOps instance for a user.
@@ -812,10 +970,11 @@ def get_memory_ops(
         memory_dir: Directory for memory files
         use_streaming: Whether to use streaming
         rate_limit_delay: Seconds to wait between LLM calls (default 2.0)
+        summary_interval: Create summaries every N turns (default 10)
     """
-    cache_key = f"{username}_{use_streaming}_{rate_limit_delay}"
+    cache_key = f"{username}_{use_streaming}_{rate_limit_delay}_{summary_interval}"
     if cache_key not in _memory_ops_cache:
-        _memory_ops_cache[cache_key] = MemoryOps(username, llm, memory_dir, use_streaming, rate_limit_delay)
+        _memory_ops_cache[cache_key] = MemoryOps(username, llm, memory_dir, use_streaming, rate_limit_delay, summary_interval)
     return _memory_ops_cache[cache_key]
 
 

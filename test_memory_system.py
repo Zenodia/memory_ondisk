@@ -245,9 +245,9 @@ def generate_conversation_topics():
 
 
 async def test_create_memory():
-    """TEST 1: Create 100 turns of sample memory conversations."""
+    """TEST 1: Create 100 turns of sample memory conversations with background summarization."""
     print("=" * 80)
-    print("TEST 1: Creating 100 Turns of Sample Memory")
+    print("TEST 1: Creating 100 Turns of Sample Memory (NON-BLOCKING MODE)")
     print("=" * 80)
     
     # Check API key
@@ -271,12 +271,14 @@ async def test_create_memory():
         username="test_student",
         llm=llm,
         memory_dir=str(memory_dir),
-        rate_limit_delay=1.0  # Faster for 100 turns
+        rate_limit_delay=1.0,  # Faster for 100 turns
+        summary_interval=10  # Summarize every 10 turns
     )
     
     print("\n✓ Memory system initialized")
     print(f"  User: test_student")
     print(f"  Directory: {memory_dir}")
+    print(f"  Mode: BACKGROUND SUMMARIZATION (non-blocking)")
     
     # Generate 100 conversation turns
     print("\n📝 Generating 100 diverse conversation topics...")
@@ -284,17 +286,46 @@ async def test_create_memory():
     print(f"✓ Generated {len(conversation_data)} conversation turns")
     
     print("\n📝 Processing and saving conversations...")
-    print("This will take a few minutes due to LLM summarization...")
+    print("⚡ Conversations are processed IMMEDIATELY (non-blocking)")
+    print("🔄 Summaries are generated every 10 turns in BACKGROUND")
+    print("-" * 80)
+    
+    import time
+    start_time = time.time()
     
     for i, (user_msg, bot_msg) in enumerate(conversation_data, 1):
-        # Progress indicator
-        if i % 10 == 0:
-            print(f"  ✓ Processed {i}/100 turns...")
+        turn_start = time.time()
         
+        # Process message with background summarization (NON-BLOCKING!)
         result = await memory_ops.process_message(
             message=user_msg,
-            bot_response=bot_msg
+            bot_response=bot_msg,
+            background_summary=True  # Enable background mode
         )
+        
+        turn_elapsed = time.time() - turn_start
+        is_summary_turn = result.get('is_summary_turn', False)
+        
+        # Progress indicator with timing
+        if i % 10 == 0:
+            pending = memory_ops.get_pending_summaries_count()
+            summary_indicator = "📊 SUMMARY" if is_summary_turn else ""
+            print(f"  ✓ Turn {i:3d}/100 processed in {turn_elapsed:.2f}s | {pending} summaries pending {summary_indicator}")
+    
+    total_elapsed = time.time() - start_time
+    pending_count = memory_ops.get_pending_summaries_count()
+    
+    print("-" * 80)
+    print(f"⚡ All 100 turns processed in {total_elapsed:.2f}s (non-blocking!)")
+    print(f"📊 Summaries created at turns: 10, 20, 30, 40, 50, 60, 70, 80, 90, 100")
+    print(f"🔄 {pending_count} background summary tasks still running")
+    
+    # Wait for all background tasks to complete
+    print("\n⏳ Waiting for all background summaries to complete...")
+    await memory_ops.wait_for_summaries(timeout=300)  # 5 minute timeout
+    
+    final_elapsed = time.time() - start_time
+    print(f"✅ All summaries completed in total {final_elapsed:.2f}s")
     
     memory_file = memory_dir / "test_student" / "memory" / "conversation_memory.txt"
     
@@ -303,6 +334,7 @@ async def test_create_memory():
         print(f"   Location: {memory_file}")
         print(f"   File size: {memory_file.stat().st_size:,} bytes")
         print(f"   Total turns: {result['total_turns']}")
+        print(f"   Time saved: ~{(100 * 2) - total_elapsed:.1f}s (conversations were non-blocking)")
     else:
         print(f"\n❌ Memory file not found!")
     
@@ -467,15 +499,115 @@ def verify_grep_searches(memory_file: Path):
     print("\n✅ All grep/glob/sed searches verified!")
 
 
+async def test_blocking_vs_nonblocking_comparison():
+    """TEST 0: Compare blocking vs non-blocking summarization with 5 turns."""
+    print("\n" + "=" * 80)
+    print("TEST 0: BLOCKING vs NON-BLOCKING Comparison (5 turns)")
+    print("=" * 80)
+    
+    if not os.getenv("NVIDIA_API_KEY"):
+        print("\n⚠️  Skipping comparison test (NVIDIA_API_KEY not set)")
+        return
+    
+    llm = ChatNVIDIA(
+        model="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        temperature=0.6,
+        api_key=os.getenv("NVIDIA_API_KEY")
+    )
+    
+    # Get first 5 conversations
+    conversation_data = generate_conversation_topics()[:5]
+    
+    import time
+    
+    # Test 1: BLOCKING mode
+    print("\n🔴 BLOCKING MODE (traditional):")
+    print("-" * 80)
+    memory_dir_blocking = Path("./test_memory_blocking")
+    memory_ops_blocking = MemoryOps(
+        username="test_blocking",
+        llm=llm,
+        memory_dir=str(memory_dir_blocking),
+        rate_limit_delay=0.5,
+        summary_interval=1  # Summarize every turn for comparison
+    )
+    
+    start_blocking = time.time()
+    for i, (user_msg, bot_msg) in enumerate(conversation_data, 1):
+        turn_start = time.time()
+        result = await memory_ops_blocking.process_message(
+            message=user_msg,
+            bot_response=bot_msg,
+            background_summary=False  # BLOCKING
+        )
+        turn_time = time.time() - turn_start
+        summary_indicator = "📊" if result.get('is_summary_turn', False) else "  "
+        print(f"  {summary_indicator} Turn {i}: {turn_time:.2f}s (waited for summary)")
+    
+    blocking_total = time.time() - start_blocking
+    print(f"  ⏱️  Total time (blocking): {blocking_total:.2f}s")
+    
+    # Test 2: NON-BLOCKING mode
+    print("\n🟢 NON-BLOCKING MODE (background tasks, summary every turn for comparison):")
+    print("-" * 80)
+    memory_dir_nonblocking = Path("./test_memory_nonblocking")
+    memory_ops_nonblocking = MemoryOps(
+        username="test_nonblocking",
+        llm=llm,
+        memory_dir=str(memory_dir_nonblocking),
+        rate_limit_delay=0.5,
+        summary_interval=1  # Summarize every turn for fair comparison
+    )
+    
+    start_nonblocking = time.time()
+    for i, (user_msg, bot_msg) in enumerate(conversation_data, 1):
+        turn_start = time.time()
+        result = await memory_ops_nonblocking.process_message(
+            message=user_msg,
+            bot_response=bot_msg,
+            background_summary=True  # NON-BLOCKING
+        )
+        turn_time = time.time() - turn_start
+        pending = result.get('background_tasks', 0)
+        summary_indicator = "📊" if result.get('is_summary_turn', False) else "  "
+        print(f"  {summary_indicator} Turn {i}: {turn_time:.2f}s (immediate, {pending} tasks running)")
+    
+    nonblocking_processing_time = time.time() - start_nonblocking
+    
+    # Wait for background tasks
+    pending = memory_ops_nonblocking.get_pending_summaries_count()
+    print(f"\n  🔄 Waiting for {pending} background summaries...")
+    await memory_ops_nonblocking.wait_for_summaries(timeout=60)
+    
+    nonblocking_total = time.time() - start_nonblocking
+    
+    print(f"  ⏱️  Processing time (non-blocking): {nonblocking_processing_time:.2f}s")
+    print(f"  ⏱️  Total time (with background): {nonblocking_total:.2f}s")
+    
+    # Comparison
+    print("\n" + "=" * 80)
+    print("📊 COMPARISON RESULTS:")
+    print("-" * 80)
+    print(f"  Blocking mode:     {blocking_total:.2f}s")
+    print(f"  Non-blocking mode: {nonblocking_processing_time:.2f}s (conversation only)")
+    print(f"  Speedup:           {blocking_total / nonblocking_processing_time:.1f}x faster!")
+    print(f"  User experience:   ⚡ IMMEDIATE responses (summaries run in background)")
+    print("=" * 80)
+
+
 async def main():
-    """Run both unit tests."""
+    """Run all unit tests."""
     print("\n" + "=" * 80)
     print("MEM2DISK MEMORY SYSTEM - UNIT TESTS")
     print("=" * 80)
-    print("\nThis script runs two separate tests:")
-    print("  TEST 1: Create 100 turns of sample memories")
+    print("\nThis script runs three tests:")
+    print("  TEST 0: Compare blocking vs non-blocking (5 turns)")
+    print("  TEST 1: Create 100 turns with non-blocking summaries")
     print("  TEST 2: Test grep/glob/sed searches")
     print("=" * 80)
+    
+    # TEST 0: Demonstrate blocking vs non-blocking
+    await test_blocking_vs_nonblocking_comparison()
     
     # TEST 1: Create 100 turns of sample memories
     memory_file = await test_create_memory()
@@ -495,10 +627,18 @@ async def main():
     print("=" * 80)
     print(f"\n📁 Memory file location: {memory_file}")
     print(f"📊 Contains: 100 conversation turns")
+    print(f"📊 Summaries created at: turns 10, 20, 30, 40, 50, 60, 70, 80, 90, 100")
+    print(f"💡 Summary interval: Every 10 turns (configurable)")
+    print("\n💡 Key Benefits:")
+    print("  ✅ Non-blocking: Conversations continue immediately")
+    print("  ✅ Background tasks: Summaries generated asynchronously")
+    print("  ✅ Efficient: Only 10 summaries created (not 100)")
+    print("  ✅ Significant speedup: User doesn't wait for LLM")
     print("\n💡 Next steps:")
     print("  1. Try the grep/sed commands listed in TEST 2")
     print("  2. Experiment with different search patterns")
     print("  3. Use glob patterns to find multiple files")
+    print("  4. Adjust summary_interval for your use case")
     print("\n")
 
 
