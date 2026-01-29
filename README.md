@@ -436,21 +436,6 @@ await memory_ops.wait_for_summaries(timeout=300)  # 5 minutes
 ## 📄 License
 
 MIT License
-
-## 🤝 Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new features
-4. Submit a pull request
-
-## 📞 Support
-
-- Report issues on GitHub
-- See documentation in `/docs`
-- Run tests to verify functionality
-
 ## 🙏 Acknowledgments
 
 Based on [standalone_agent_memory](https://github.com/Zenodia/standalone_agent_memory) by Zenodia.
