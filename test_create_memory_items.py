@@ -1,11 +1,16 @@
 """
-Unit test script for Mem2Disk memory system.
+Unit test script for Mem2Disk memory system (NON-BLOCKING MODE).
 
 Purpose:
-1. TEST 1: Create 100 turns of sample memory conversations
+1. TEST 1: Create 100 turns of sample memory conversations with background summarization
 2. TEST 2: Test grep/glob/sed searches on conversation_memory.txt
 
-Run with: python test_memory_system.py
+Features:
+- Non-blocking background summarization (immediate conversation processing)
+- Subprocess-based file operations (grep/sed/awk for efficiency)
+- Summary interval: Every 10 turns (configurable)
+
+Run with: python test_create_memory_items.py
 """
 
 import os
@@ -261,7 +266,7 @@ def generate_conversation_topics():
 
 
 async def test_create_memory():
-    """TEST 1: Create 100 turns of sample memory conversations with background summarization."""
+    """Create 100 turns of sample memory conversations with background summarization."""
     print("=" * 80)
     print("TEST 1: Creating 100 Turns of Sample Memory (NON-BLOCKING MODE)")
     print("=" * 80)
@@ -358,7 +363,7 @@ async def test_create_memory():
 
 
 def test_grep_glob_sed_searches(memory_file: Path):
-    """TEST 2: Test grep/glob/sed searches on conversation_memory.txt file."""
+    """Test grep/glob/sed searches on conversation_memory.txt file."""
     print("\n\n" + "=" * 80)
     print("TEST 2: Grep/Glob/Sed Searches on conversation_memory.txt")
     print("=" * 80)
@@ -612,20 +617,20 @@ async def test_blocking_vs_nonblocking_comparison():
 
 
 async def main():
-    """Run all unit tests."""
+    """Run all unit tests (NON-BLOCKING MODE ONLY)."""
     print("\n" + "=" * 80)
-    print("MEM2DISK MEMORY SYSTEM - UNIT TESTS")
+    print("MEM2DISK MEMORY SYSTEM - NON-BLOCKING TESTS")
     print("=" * 80)
-    print("\nThis script runs three tests:")
-    print("  TEST 0: Compare blocking vs non-blocking (5 turns)")
+    print("\nThis script runs two tests:")
     print("  TEST 1: Create 100 turns with non-blocking summaries")
     print("  TEST 2: Test grep/glob/sed searches")
     print("=" * 80)
     
-    # TEST 0: Demonstrate blocking vs non-blocking
-    await test_blocking_vs_nonblocking_comparison()
+    # SKIPPING TEST 0 (blocking vs non-blocking comparison)
+    # To enable comparison test, uncomment the line below:
+    # await test_blocking_vs_nonblocking_comparison()
     
-    # TEST 1: Create 100 turns of sample memories
+    # TEST 1: Create 100 turns of sample memories (NON-BLOCKING)
     memory_file = await test_create_memory()
     
     if not memory_file:
@@ -645,16 +650,19 @@ async def main():
     print(f"📊 Contains: 100 conversation turns")
     print(f"📊 Summaries created at: turns 10, 20, 30, 40, 50, 60, 70, 80, 90, 100")
     print(f"💡 Summary interval: Every 10 turns (configurable)")
-    print("\n💡 Key Benefits:")
+    print("\n💡 Key Benefits of Non-Blocking Mode:")
     print("  ✅ Non-blocking: Conversations continue immediately")
     print("  ✅ Background tasks: Summaries generated asynchronously")
     print("  ✅ Efficient: Only 10 summaries created (not 100)")
     print("  ✅ Significant speedup: User doesn't wait for LLM")
+    print("  ✅ Better UX: No blocking delays in conversation flow")
     print("\n💡 Next steps:")
     print("  1. Try the grep/sed commands listed in TEST 2")
     print("  2. Experiment with different search patterns")
     print("  3. Use glob patterns to find multiple files")
     print("  4. Adjust summary_interval for your use case")
+    print("\n💡 To enable blocking vs non-blocking comparison:")
+    print("  Uncomment the line in main() that calls test_blocking_vs_nonblocking_comparison()")
     print("\n")
 
 

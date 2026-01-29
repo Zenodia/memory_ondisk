@@ -13,3 +13,4 @@ test_memory/
 test_memory_blocking/
 test_memory_nonblocking/
 demo_memory/
+.venv/

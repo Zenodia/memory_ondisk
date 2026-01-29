@@ -3,6 +3,8 @@ import json
 import uuid
 import re
 import time
+import subprocess
+import tempfile
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pathlib import Path
@@ -164,6 +166,7 @@ class MemoryHandler:
         # Memory settings (NO VECTOR STORE - pure text-based)
         self.summary = ""
         self._all_interactions = []  # Store raw interactions for text file
+        self._last_saved_turn = 0  # Track last saved turn for append-only updates
         
         # Create memory extraction chain with Orin-style prompt
         memory_extract_prompt = """You are Ollie, an AI tutor, creating your own memory summary from {time_period}. Write in FIRST PERSON ("I worked with...", "My student showed...").
@@ -373,6 +376,7 @@ Your summary:
     def update_interaction_summary(self, turn_number: int, summary: str) -> bool:
         """
         Update the summary for an existing interaction (called by background task).
+        Uses sed to update in-place for efficiency.
         
         Args:
             turn_number: Turn number to update
@@ -385,16 +389,129 @@ Your summary:
             if interaction['turn'] == turn_number:
                 interaction['summary'] = summary
                 print(Fore.LIGHTMAGENTA_EX + f"✓ Updated summary for turn #{turn_number} (background)", Fore.RESET)
-                # Save to file with updated summary
-                self.save_memory_to_file()
+                
+                # Update summary in file using sed (more efficient than rewriting)
+                if self.memory_file.exists():
+                    self._update_turn_summary_in_file(turn_number, summary)
+                else:
+                    # File doesn't exist yet, just save normally
+                    self.save_memory_to_file()
+                
                 return True
         
         print(Fore.YELLOW + f"Warning: Could not find turn #{turn_number} to update", Fore.RESET)
         return False
     
+    def _update_turn_summary_in_file(self, turn_number: int, summary: str) -> None:
+        """
+        Update a turn's summary in the file using sed and temp files.
+        Strategy: Delete old summary (if exists), then insert new one using awk.
+        """
+        file_path = str(self.memory_file)
+        turn_str = f"{turn_number:04d}"
+        
+        # Create backup before modifying
+        backup_path = f"{file_path}.backup"
+        try:
+            subprocess.run(['cp', file_path, backup_path], check=True, capture_output=True)
+        except Exception as e:
+            print(Fore.YELLOW + f"Warning: Could not create backup: {e}", Fore.RESET)
+        
+        try:
+            # Check if summary already exists for this turn
+            result = subprocess.run(
+                ['grep', '-q', f'>>>SUMMARY:{turn_str}>>>', file_path],
+                capture_output=True
+            )
+            
+            if result.returncode == 0:
+                # Summary exists, delete it first using sed
+                result = subprocess.run(
+                    ['sed', '-i.bak', f'/>>>SUMMARY:{turn_str}>>>/,/<<<SUMMARY:{turn_str}<<</d', file_path],
+                    check=False,
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode != 0:
+                    print(Fore.YELLOW + f"Warning: sed delete failed: {result.stderr}", Fore.RESET)
+                    raise Exception(f"sed delete failed: {result.stderr}")
+            
+            # Create temp file with the summary block to insert
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp:
+                tmp.write(f">>>SUMMARY:{turn_str}>>>\n")
+                tmp.write(f"{summary}\n")
+                tmp.write(f"<<<SUMMARY:{turn_str}<<<\n")
+                tmp.write("\n")
+                tmp_path = tmp.name
+            
+            try:
+                # Use awk to insert the summary before <<<END_TURN:turn_str>>>
+                # This avoids all the escaping issues with sed
+                result = subprocess.run(
+                    ['bash', '-c',
+                     f'awk \'BEGIN{{inserted=0}} /<<<END_TURN:{turn_str}>>>/ && inserted==0 {{system("cat {tmp_path}"); inserted=1}} {{print}}\' {file_path} > {file_path}.tmp && mv {file_path}.tmp {file_path}'],
+                    check=False,
+                    capture_output=True,
+                    text=True
+                )
+                
+                if result.returncode != 0:
+                    print(Fore.RED + f"Error: awk command failed: {result.stderr}", Fore.RESET)
+                    raise Exception(f"awk failed: {result.stderr}")
+                
+                # Verify the file still has all turns
+                verify_result = subprocess.run(
+                    ['grep', '-c', '<<<TURN:', file_path],
+                    capture_output=True,
+                    text=True
+                )
+                turn_count = int(verify_result.stdout.strip()) if verify_result.returncode == 0 else 0
+                expected_count = len(self._all_interactions)
+                
+                if turn_count != expected_count:
+                    print(Fore.RED + f"Error: Turn count mismatch! Expected {expected_count}, found {turn_count}", Fore.RESET)
+                    print(Fore.YELLOW + f"Restoring from backup...", Fore.RESET)
+                    subprocess.run(['cp', backup_path, file_path], check=True, capture_output=True)
+                    raise Exception(f"Turn count mismatch after update")
+                
+                print(Fore.LIGHTCYAN_EX + f"✓ Updated summary in file for turn #{turn_number} using awk", Fore.RESET)
+                
+                # Remove backup on success
+                if os.path.exists(backup_path):
+                    os.unlink(backup_path)
+                
+            finally:
+                # Clean up temp file
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            
+        except Exception as e:
+            print(Fore.YELLOW + f"Warning: Could not update summary with subprocess: {e}", Fore.RESET)
+            print(Fore.YELLOW + f"Restoring from backup and falling back to full rewrite...", Fore.RESET)
+            
+            # Restore from backup
+            if os.path.exists(backup_path):
+                try:
+                    subprocess.run(['cp', backup_path, file_path], check=True, capture_output=True)
+                    print(Fore.GREEN + f"✓ Restored from backup", Fore.RESET)
+                except:
+                    pass
+            
+            # Fallback: mark turns from this one onwards as needing re-save
+            if turn_number <= self._last_saved_turn:
+                self._last_saved_turn = turn_number - 1
+            self.save_memory_to_file()
+        finally:
+            # Clean up backup file if it still exists
+            if os.path.exists(backup_path):
+                try:
+                    os.unlink(backup_path)
+                except:
+                    pass
+    
     def search_text_file(self, pattern: str, case_sensitive: bool = False) -> List[str]:
         """
-        Search the memory text file using regex pattern (simulates grep).
+        Search the memory text file using subprocess with grep.
         
         Args:
             pattern: Regex pattern to search for
@@ -407,80 +524,66 @@ Your summary:
             return []
         
         try:
-            with open(self.memory_file, 'r', encoding='utf-8') as f:
-                content = f.read()
+            # Build grep command
+            grep_cmd = ['grep']
+            if not case_sensitive:
+                grep_cmd.append('-i')  # case insensitive
+            grep_cmd.extend(['-E', pattern, str(self.memory_file)])  # Extended regex
             
-            flags = 0 if case_sensitive else re.IGNORECASE
-            matches = []
+            # Run grep command
+            result = subprocess.run(
+                grep_cmd,
+                capture_output=True,
+                text=True,
+                check=False  # Don't raise exception if no matches (exit code 1)
+            )
             
-            for line in content.split('\n'):
-                if re.search(pattern, line, flags):
-                    matches.append(line)
+            # grep returns exit code 1 if no matches found, which is not an error
+            if result.returncode == 0:
+                matches = result.stdout.strip().split('\n')
+                matches = [m for m in matches if m]  # Filter empty strings
+            elif result.returncode == 1:
+                matches = []  # No matches found
+            else:
+                # Actual error occurred
+                print(Fore.RED + f"grep error: {result.stderr}", Fore.RESET)
+                return []
             
             print(Fore.CYAN + f"Found {len(matches)} matches for pattern: {pattern}", Fore.RESET)
             return matches
             
         except Exception as e:
-            print(Fore.RED + f"Error searching text file: {e}", Fore.RESET)
+            print(Fore.RED + f"Error searching text file with grep: {e}", Fore.RESET)
             return []
     
     def save_memory_to_file(self) -> bool:
-        """Save all interactions to plain text file with grep-friendly anchors."""
+        """Save interactions to file using subprocess (efficient append for existing files)."""
         try:
             if not hasattr(self, '_all_interactions'):
                 self._all_interactions = []
             
-            with open(self.memory_file, 'w', encoding='utf-8') as f:
-                # Header with anchors
-                f.write("@@@MEMORY_LOG_START@@@\n")
-                f.write(f"@USERNAME:{self.username}@\n")
-                f.write(f"@USER_ID:{self.user_id}@\n")
-                f.write(f"@LAST_UPDATED:{datetime.now().isoformat()}@\n")
-                f.write(f"@TOTAL_TURNS:{len(self._all_interactions)}@\n")
-                f.write("=" * 80 + "\n\n")
-                
-                # Summary section with anchor
-                if self.summary:
-                    f.write("###SUMMARY_START###\n")
-                    f.write(f"{self.summary}\n")
-                    f.write("###SUMMARY_END###\n\n")
-                
-                # Interaction turns with clear anchors
-                f.write(f">>>TURNS_START<<< (Total: {len(self._all_interactions)})\n")
-                f.write("=" * 80 + "\n\n")
-                
-                for interaction in self._all_interactions:
-                    turn_num = interaction['turn']
-                    
-                    # Turn marker - easy to grep
-                    f.write(f"<<<TURN:{turn_num:04d}>>>\n")
-                    f.write(f"@TURN_ID:{interaction['id']}@\n")
-                    f.write(f"@TIMESTAMP:{interaction['timestamp']}@\n")
-                    f.write(f"@DATE:{interaction['date']}@\n")
-                    f.write(f"@USER_ID:{interaction['user_id']}@\n")
-                    f.write("-" * 80 + "\n")
-                    
-                    # User message with marker
-                    f.write(f">>>USER:{turn_num:04d}>>>\n")
-                    f.write(f"{interaction['user_message']}\n")
-                    f.write(f"<<<USER:{turn_num:04d}<<<\n\n")
-                    
-                    # Bot message with marker
-                    f.write(f">>>BOT:{turn_num:04d}>>>\n")
-                    f.write(f"{interaction['bot_message']}\n")
-                    f.write(f"<<<BOT:{turn_num:04d}<<<\n\n")
-                    
-                    # Summary if available
-                    if interaction.get('summary'):
-                        f.write(f">>>SUMMARY:{turn_num:04d}>>>\n")
-                        f.write(f"{interaction['summary']}\n")
-                        f.write(f"<<<SUMMARY:{turn_num:04d}<<<\n\n")
-                    
-                    f.write(f"<<<END_TURN:{turn_num:04d}>>>\n")
-                    f.write("=" * 80 + "\n\n")
-                
-                f.write(">>>TURNS_END<<<\n")
-                f.write("@@@MEMORY_LOG_END@@@\n")
+            file_path = str(self.memory_file)
+            file_exists = self.memory_file.exists()
+            
+            if not file_exists:
+                # First time: Create complete file structure using echo and redirection
+                self._create_new_memory_file()
+            else:
+                # File exists: Update metadata and append only new turns
+                self._append_to_memory_file()
+            
+            # Verify file integrity after save
+            if not self.verify_file_integrity():
+                print(Fore.YELLOW + "File integrity check failed, attempting repair...", Fore.RESET)
+                # Force full rewrite as repair
+                self._last_saved_turn = 0
+                self._create_new_memory_file()
+                # Verify again
+                if not self.verify_file_integrity():
+                    print(Fore.RED + "✗ Repair failed - file may be corrupted", Fore.RESET)
+                    return False
+                else:
+                    print(Fore.GREEN + "✓ File repaired successfully", Fore.RESET)
             
             print(Fore.GREEN + f"✓ Saved {len(self._all_interactions)} interactions to {self.memory_file.name}", Fore.RESET)
             print(Fore.CYAN + f"  Use grep '<<<TURN:' to find all turns", Fore.RESET)
@@ -492,6 +595,407 @@ Your summary:
             import traceback
             traceback.print_exc()
             return False
+    
+    def _create_new_memory_file(self) -> None:
+        """Create new memory file from scratch (using temp file + mv for atomicity)."""
+        # Build the complete file content
+        lines = []
+        lines.append("@@@MEMORY_LOG_START@@@")
+        lines.append(f"@USERNAME:{self.username}@")
+        lines.append(f"@USER_ID:{self.user_id}@")
+        lines.append(f"@LAST_UPDATED:{datetime.now().isoformat()}@")
+        lines.append(f"@TOTAL_TURNS:{len(self._all_interactions)}@")
+        lines.append("=" * 80)
+        
+        # Summary section (with no extra empty line before it)
+        if self.summary:
+            lines.append("###SUMMARY_START###")
+            lines.append(self.summary)
+            lines.append("###SUMMARY_END###")
+            lines.append("")  # One empty line after summary
+        
+        # Turns section
+        lines.append(f">>>TURNS_START<<< (Total: {len(self._all_interactions)})")
+        lines.append("=" * 80)
+        lines.append("")
+        
+        # Add all interactions
+        for interaction in self._all_interactions:
+            lines.extend(self._format_interaction(interaction))
+        
+        lines.append(">>>TURNS_END<<<")
+        lines.append("@@@MEMORY_LOG_END@@@")
+        
+        content = '\n'.join(lines)
+        
+        # Write to temp file then use mv for atomic operation
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', dir=self.memory_dir) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        try:
+            # Use mv command to atomically move temp file to final location
+            subprocess.run(
+                ['mv', tmp_path, str(self.memory_file)],
+                check=True,
+                capture_output=True
+            )
+            
+            self._last_saved_turn = max([i['turn'] for i in self._all_interactions]) if self._all_interactions else 0
+            print(Fore.LIGHTCYAN_EX + f"✓ Created new memory file with {len(self._all_interactions)} turns", Fore.RESET)
+            
+        except Exception as e:
+            # Clean up temp file on error
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise e
+    
+    def _append_to_memory_file(self) -> None:
+        """Append new interactions to existing file using sed and echo."""
+        file_path = str(self.memory_file)
+        
+        # Create backup before any modifications
+        backup_path = f"{file_path}.backup"
+        try:
+            subprocess.run(['cp', file_path, backup_path], check=True, capture_output=True)
+        except Exception as e:
+            print(Fore.YELLOW + f"Warning: Could not create backup: {e}", Fore.RESET)
+        
+        try:
+            # Update LAST_UPDATED using sed -i
+            timestamp = datetime.now().isoformat()
+            subprocess.run(
+                ['sed', '-i', f's/@LAST_UPDATED:[^@]*@/@LAST_UPDATED:{timestamp}@/', file_path],
+                check=True,
+                capture_output=True
+            )
+            
+            # Update TOTAL_TURNS using sed -i
+            total_turns = len(self._all_interactions)
+            subprocess.run(
+                ['sed', '-i', f's/@TOTAL_TURNS:[^@]*@/@TOTAL_TURNS:{total_turns}@/', file_path],
+                check=True,
+                capture_output=True
+            )
+            
+            # Update TURNS_START line using sed -i
+            subprocess.run(
+                ['sed', '-i', f's/>>>TURNS_START<<< (Total: [0-9]*)/>>>TURNS_START<<< (Total: {total_turns})/', file_path],
+                check=True,
+                capture_output=True
+            )
+            
+            # Update summary section if it changed (use temp file approach to avoid escaping issues)
+            if self.summary:
+                # Check if summary section exists
+                result = subprocess.run(
+                    ['grep', '-q', '###SUMMARY_START###', file_path],
+                    capture_output=True
+                )
+                
+                # Create temp file with new summary (includes trailing blank line)
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp:
+                    tmp.write(f"###SUMMARY_START###\n{self.summary}\n###SUMMARY_END###\n\n")
+                    summary_tmp_path = tmp.name
+                
+                try:
+                    if result.returncode == 0:
+                        # Summary exists, delete old one INCLUDING trailing empty lines
+                        # Use awk to delete from ###SUMMARY_START### to ###SUMMARY_END### 
+                        # AND any consecutive empty lines that follow
+                        subprocess.run(
+                            ['bash', '-c',
+                             f'awk \'/^###SUMMARY_START###$/{{skip=1}} skip==1 && /^###SUMMARY_END###$/{{skip=2; next}} skip==2 && /^$/ {{next}} skip==2 && /[^[:space:]]/ {{skip=0}} skip==0{{print}}\' {file_path} > {file_path}.tmp && mv {file_path}.tmp {file_path}'],
+                            check=True,
+                            capture_output=True,
+                            text=True
+                        )
+                    
+                    # Insert new summary after the header (after first line of 80 equals signs)
+                    # The temp file already contains the trailing blank line, so don't add another one
+                    subprocess.run(
+                        ['bash', '-c', 
+                         f'awk \'BEGIN{{found=0}} /^================================================================================$/ && found==0 {{print; system("cat {summary_tmp_path}"); found=1; next}} {{print}}\' {file_path} > {file_path}.tmp && mv {file_path}.tmp {file_path}'],
+                        check=True,
+                        capture_output=True,
+                        text=True
+                    )
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(summary_tmp_path):
+                        os.unlink(summary_tmp_path)
+            
+            # Append only NEW turns (after _last_saved_turn)
+            new_interactions = [i for i in self._all_interactions if i['turn'] > self._last_saved_turn]
+            
+            if new_interactions:
+                # Build content for new turns
+                new_lines = []
+                for interaction in new_interactions:
+                    new_lines.extend(self._format_interaction(interaction))
+                
+                new_content = '\n'.join(new_lines)
+                
+                # Create temporary file with new content
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', dir=self.memory_dir) as tmp:
+                    tmp.write(new_content + '\n')
+                    tmp_path = tmp.name
+                
+                try:
+                    # Insert new turns before the ending markers using sed
+                    # This removes the ending markers, appends new content, then re-adds markers
+                    subprocess.run(
+                        ['sed', '-i', '/>>>TURNS_END<<</d', file_path],
+                        check=True,
+                        capture_output=True
+                    )
+                    subprocess.run(
+                        ['sed', '-i', '/@@@MEMORY_LOG_END@@@/d', file_path],
+                        check=True,
+                        capture_output=True
+                    )
+                    
+                    # Append new turns using cat
+                    subprocess.run(
+                        ['bash', '-c', f'cat {subprocess.list2cmdline([tmp_path])} >> {subprocess.list2cmdline([file_path])}'],
+                        check=True,
+                        capture_output=True
+                    )
+                    
+                    # Re-add ending markers using echo
+                    with open(file_path, 'a') as f:
+                        f.write(">>>TURNS_END<<<\n")
+                        f.write("@@@MEMORY_LOG_END@@@\n")
+                    
+                    # Verify the file integrity
+                    verify_result = subprocess.run(
+                        ['grep', '-c', '<<<TURN:', file_path],
+                        capture_output=True,
+                        text=True
+                    )
+                    turn_count = int(verify_result.stdout.strip()) if verify_result.returncode == 0 else 0
+                    expected_count = len(self._all_interactions)
+                    
+                    if turn_count != expected_count:
+                        print(Fore.RED + f"Error: Turn count mismatch! Expected {expected_count}, found {turn_count}", Fore.RESET)
+                        print(Fore.YELLOW + f"Restoring from backup and doing full rewrite...", Fore.RESET)
+                        # Restore from backup
+                        if os.path.exists(backup_path):
+                            subprocess.run(['cp', backup_path, file_path], check=True, capture_output=True)
+                        # Force full rewrite
+                        self._last_saved_turn = 0
+                        self._create_new_memory_file()
+                        return
+                    
+                    self._last_saved_turn = max([i['turn'] for i in self._all_interactions])
+                    print(Fore.LIGHTCYAN_EX + f"✓ Appended {len(new_interactions)} new turn(s) to memory file", Fore.RESET)
+                    
+                    # Remove backup on success
+                    if os.path.exists(backup_path):
+                        os.unlink(backup_path)
+                    
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+            else:
+                print(Fore.LIGHTCYAN_EX + f"✓ Updated metadata (no new turns to append)", Fore.RESET)
+                # Remove backup if no new turns
+                if os.path.exists(backup_path):
+                    os.unlink(backup_path)
+        
+        except Exception as e:
+            print(Fore.RED + f"Error in _append_to_memory_file: {e}", Fore.RESET)
+            # Restore from backup on error
+            if os.path.exists(backup_path):
+                try:
+                    subprocess.run(['cp', backup_path, file_path], check=True, capture_output=True)
+                    print(Fore.GREEN + f"✓ Restored from backup", Fore.RESET)
+                except Exception as restore_error:
+                    print(Fore.RED + f"Error restoring backup: {restore_error}", Fore.RESET)
+            raise
+        finally:
+            # Clean up backup file if it still exists
+            if os.path.exists(backup_path):
+                try:
+                    os.unlink(backup_path)
+                except:
+                    pass
+    
+    def _format_interaction(self, interaction: Dict[str, Any]) -> List[str]:
+        """Format a single interaction into lines for file output."""
+        turn_num = interaction['turn']
+        lines = []
+        
+        # Turn marker
+        lines.append(f"<<<TURN:{turn_num:04d}>>>")
+        lines.append(f"@TURN_ID:{interaction['id']}@")
+        lines.append(f"@TIMESTAMP:{interaction['timestamp']}@")
+        lines.append(f"@DATE:{interaction['date']}@")
+        lines.append(f"@USER_ID:{interaction['user_id']}@")
+        lines.append("-" * 80)
+        
+        # User message
+        lines.append(f">>>USER:{turn_num:04d}>>>")
+        lines.append(interaction['user_message'])
+        lines.append(f"<<<USER:{turn_num:04d}<<<")
+        lines.append("")
+        
+        # Bot message
+        lines.append(f">>>BOT:{turn_num:04d}>>>")
+        lines.append(interaction['bot_message'])
+        lines.append(f"<<<BOT:{turn_num:04d}<<<")
+        lines.append("")
+        
+        # Summary if available
+        if interaction.get('summary'):
+            lines.append(f">>>SUMMARY:{turn_num:04d}>>>")
+            lines.append(interaction['summary'])
+            lines.append(f"<<<SUMMARY:{turn_num:04d}<<<")
+            lines.append("")
+        
+        lines.append(f"<<<END_TURN:{turn_num:04d}>>>")
+        lines.append("=" * 80)
+        lines.append("")
+        
+        return lines
+    
+    def verify_file_integrity(self) -> bool:
+        """
+        Verify the integrity of the memory file.
+        Checks that all turns in memory are present in the file.
+        
+        Returns:
+            True if file is intact, False otherwise
+        """
+        if not self.memory_file.exists():
+            print(Fore.YELLOW + "Memory file does not exist", Fore.RESET)
+            return False
+        
+        try:
+            # Count turns in file
+            result = subprocess.run(
+                ['grep', '-c', '<<<TURN:', str(self.memory_file)],
+                capture_output=True,
+                text=True
+            )
+            file_turn_count = int(result.stdout.strip()) if result.returncode == 0 else 0
+            
+            # Count turns in memory
+            memory_turn_count = len(self._all_interactions)
+            
+            if file_turn_count != memory_turn_count:
+                print(Fore.RED + f"✗ Integrity check failed: File has {file_turn_count} turns, memory has {memory_turn_count} turns", Fore.RESET)
+                return False
+            
+            # Check for essential markers
+            essential_markers = [
+                '@@@MEMORY_LOG_START@@@',
+                '>>>TURNS_START<<<',
+                '>>>TURNS_END<<<',
+                '@@@MEMORY_LOG_END@@@'
+            ]
+            
+            for marker in essential_markers:
+                result = subprocess.run(
+                    ['grep', '-q', marker, str(self.memory_file)],
+                    capture_output=True
+                )
+                if result.returncode != 0:
+                    print(Fore.RED + f"✗ Integrity check failed: Missing marker '{marker}'", Fore.RESET)
+                    return False
+            
+            print(Fore.GREEN + f"✓ File integrity verified: {file_turn_count} turns", Fore.RESET)
+            return True
+            
+        except Exception as e:
+            print(Fore.RED + f"Error verifying file integrity: {e}", Fore.RESET)
+            return False
+    
+    def diagnose_file(self) -> Dict[str, Any]:
+        """
+        Diagnose the memory file and return statistics.
+        
+        Returns:
+            Dictionary with file diagnostics
+        """
+        if not self.memory_file.exists():
+            return {
+                "exists": False,
+                "error": "File does not exist"
+            }
+        
+        try:
+            # Get file size
+            file_size = os.path.getsize(self.memory_file)
+            
+            # Count turns
+            result = subprocess.run(
+                ['grep', '-c', '<<<TURN:', str(self.memory_file)],
+                capture_output=True,
+                text=True
+            )
+            turn_count = int(result.stdout.strip()) if result.returncode == 0 else 0
+            
+            # Count user messages
+            result = subprocess.run(
+                ['grep', '-c', '>>>USER:', str(self.memory_file)],
+                capture_output=True,
+                text=True
+            )
+            user_msg_count = int(result.stdout.strip()) if result.returncode == 0 else 0
+            
+            # Count bot messages
+            result = subprocess.run(
+                ['grep', '-c', '>>>BOT:', str(self.memory_file)],
+                capture_output=True,
+                text=True
+            )
+            bot_msg_count = int(result.stdout.strip()) if result.returncode == 0 else 0
+            
+            # Count summaries
+            result = subprocess.run(
+                ['grep', '-c', '>>>SUMMARY:', str(self.memory_file)],
+                capture_output=True,
+                text=True
+            )
+            summary_count = int(result.stdout.strip()) if result.returncode == 0 else 0
+            
+            # Check for essential markers
+            markers_present = {}
+            essential_markers = [
+                '@@@MEMORY_LOG_START@@@',
+                '@@@MEMORY_LOG_END@@@',
+                '>>>TURNS_START<<<',
+                '>>>TURNS_END<<<'
+            ]
+            for marker in essential_markers:
+                result = subprocess.run(
+                    ['grep', '-q', marker, str(self.memory_file)],
+                    capture_output=True
+                )
+                markers_present[marker] = (result.returncode == 0)
+            
+            diagnostics = {
+                "exists": True,
+                "file_size": file_size,
+                "turn_count": turn_count,
+                "user_msg_count": user_msg_count,
+                "bot_msg_count": bot_msg_count,
+                "summary_count": summary_count,
+                "markers_present": markers_present,
+                "memory_turn_count": len(self._all_interactions),
+                "integrity_ok": (turn_count == len(self._all_interactions) and 
+                                all(markers_present.values()))
+            }
+            
+            return diagnostics
+            
+        except Exception as e:
+            return {
+                "exists": True,
+                "error": str(e)
+            }
     
     def get_search_examples(self) -> str:
         """
@@ -549,81 +1053,142 @@ Your summary:
         return examples
     
     def load_memory_from_file(self) -> bool:
-        """Load interactions from plain text file for returning users."""
+        """Load interactions from plain text file using subprocess (grep/sed)."""
         try:
             if not self.memory_file.exists():
                 print(Fore.YELLOW + f"No existing memory file found for user {self.username} (new user)", Fore.RESET)
                 self._all_interactions = []
                 self.turn_counter = 0
+                self._last_saved_turn = 0
                 return False
             
-            with open(self.memory_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # Parse header
+            # Parse header - Extract metadata using grep
             last_updated = "Unknown"
             total_turns = 0
             
-            # Extract metadata using anchors
-            if "@LAST_UPDATED:" in content:
-                match = re.search(r'@LAST_UPDATED:([^@]+)@', content)
-                if match:
-                    last_updated = match.group(1)
+            # Extract LAST_UPDATED using grep
+            try:
+                result = subprocess.run(
+                    ['grep', '-oP', r'@LAST_UPDATED:\K[^@]+', str(self.memory_file)],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    last_updated = result.stdout.strip()
+            except Exception as e:
+                print(Fore.YELLOW + f"Could not extract LAST_UPDATED: {e}", Fore.RESET)
             
-            if "@TOTAL_TURNS:" in content:
-                match = re.search(r'@TOTAL_TURNS:([^@]+)@', content)
-                if match:
-                    total_turns = int(match.group(1))
+            # Extract TOTAL_TURNS using grep
+            try:
+                result = subprocess.run(
+                    ['grep', '-oP', r'@TOTAL_TURNS:\K[^@]+', str(self.memory_file)],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    total_turns = int(result.stdout.strip())
+            except Exception as e:
+                print(Fore.YELLOW + f"Could not extract TOTAL_TURNS: {e}", Fore.RESET)
             
-            # Extract summary
-            summary_match = re.search(r'###SUMMARY_START###\n(.+?)\n###SUMMARY_END###', content, re.DOTALL)
-            if summary_match:
-                self.summary = summary_match.group(1).strip()
-            else:
+            # Extract summary using sed
+            try:
+                result = subprocess.run(
+                    ['sed', '-n', '/###SUMMARY_START###/,/###SUMMARY_END###/p', str(self.memory_file)],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    summary_text = result.stdout.strip()
+                    # Remove the markers
+                    summary_text = summary_text.replace('###SUMMARY_START###', '').replace('###SUMMARY_END###', '').strip()
+                    self.summary = summary_text
+                else:
+                    self.summary = ""
+            except Exception as e:
+                print(Fore.YELLOW + f"Could not extract summary: {e}", Fore.RESET)
                 self.summary = ""
             
-            # Parse all turns
-            interactions = []
-            turn_pattern = r'<<<TURN:(\d{4})>>>(.*?)<<<END_TURN:\1>>>'
-            turn_matches = re.finditer(turn_pattern, content, re.DOTALL)
+            # Get all turn numbers using grep
+            try:
+                result = subprocess.run(
+                    ['grep', '-oP', r'<<<TURN:\K\d{4}', str(self.memory_file)],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    # No turns found
+                    self._all_interactions = []
+                    self.turn_counter = 0
+                    return True
+                
+                turn_numbers = [int(num) for num in result.stdout.strip().split('\n')]
+            except Exception as e:
+                print(Fore.RED + f"Error extracting turn numbers: {e}", Fore.RESET)
+                self._all_interactions = []
+                self.turn_counter = 0
+                return False
             
-            for match in turn_matches:
-                turn_num = int(match.group(1))
-                turn_content = match.group(2)
-                
-                # Extract turn details
-                turn_id_match = re.search(r'@TURN_ID:([^@]+)@', turn_content)
-                timestamp_match = re.search(r'@TIMESTAMP:([^@]+)@', turn_content)
-                date_match = re.search(r'@DATE:([^@]+)@', turn_content)
-                user_id_match = re.search(r'@USER_ID:([^@]+)@', turn_content)
-                
-                # Extract user message
-                user_msg_match = re.search(rf'>>>USER:{turn_num:04d}>>>\n(.*?)\n<<<USER:{turn_num:04d}<<<', turn_content, re.DOTALL)
-                user_msg = user_msg_match.group(1).strip() if user_msg_match else ""
-                
-                # Extract bot message
-                bot_msg_match = re.search(rf'>>>BOT:{turn_num:04d}>>>\n(.*?)\n<<<BOT:{turn_num:04d}<<<', turn_content, re.DOTALL)
-                bot_msg = bot_msg_match.group(1).strip() if bot_msg_match else ""
-                
-                # Extract summary if available
-                summary_match = re.search(rf'>>>SUMMARY:{turn_num:04d}>>>\n(.*?)\n<<<SUMMARY:{turn_num:04d}<<<', turn_content, re.DOTALL)
-                turn_summary = summary_match.group(1).strip() if summary_match else ""
-                
-                interaction = {
-                    "turn": turn_num,
-                    "id": turn_id_match.group(1) if turn_id_match else str(uuid.uuid4()),
-                    "timestamp": timestamp_match.group(1) if timestamp_match else "unknown",
-                    "date": date_match.group(1) if date_match else "unknown",
-                    "user_id": user_id_match.group(1) if user_id_match else self.user_id,
-                    "user_message": user_msg,
-                    "bot_message": bot_msg,
-                    "summary": turn_summary
-                }
-                
-                interactions.append(interaction)
+            # Parse all turns using sed
+            interactions = []
+            for turn_num in turn_numbers:
+                try:
+                    turn_str = f"{turn_num:04d}"
+                    
+                    # Extract entire turn block using sed
+                    result = subprocess.run(
+                        ['sed', '-n', f'/<<<TURN:{turn_str}>>>/,/<<<END_TURN:{turn_str}>>>/p', str(self.memory_file)],
+                        capture_output=True,
+                        text=True,
+                        check=False
+                    )
+                    
+                    if result.returncode != 0 or not result.stdout.strip():
+                        continue
+                    
+                    turn_content = result.stdout
+                    
+                    # Extract turn details using regex (after sed extraction)
+                    turn_id_match = re.search(r'@TURN_ID:([^@]+)@', turn_content)
+                    timestamp_match = re.search(r'@TIMESTAMP:([^@]+)@', turn_content)
+                    date_match = re.search(r'@DATE:([^@]+)@', turn_content)
+                    user_id_match = re.search(r'@USER_ID:([^@]+)@', turn_content)
+                    
+                    # Extract user message using sed for this specific turn content
+                    user_msg_match = re.search(rf'>>>USER:{turn_str}>>>\n(.*?)\n<<<USER:{turn_str}<<<', turn_content, re.DOTALL)
+                    user_msg = user_msg_match.group(1).strip() if user_msg_match else ""
+                    
+                    # Extract bot message
+                    bot_msg_match = re.search(rf'>>>BOT:{turn_str}>>>\n(.*?)\n<<<BOT:{turn_str}<<<', turn_content, re.DOTALL)
+                    bot_msg = bot_msg_match.group(1).strip() if bot_msg_match else ""
+                    
+                    # Extract summary if available
+                    summary_match = re.search(rf'>>>SUMMARY:{turn_str}>>>\n(.*?)\n<<<SUMMARY:{turn_str}<<<', turn_content, re.DOTALL)
+                    turn_summary = summary_match.group(1).strip() if summary_match else ""
+                    
+                    interaction = {
+                        "turn": turn_num,
+                        "id": turn_id_match.group(1) if turn_id_match else str(uuid.uuid4()),
+                        "timestamp": timestamp_match.group(1) if timestamp_match else "unknown",
+                        "date": date_match.group(1) if date_match else "unknown",
+                        "user_id": user_id_match.group(1) if user_id_match else self.user_id,
+                        "user_message": user_msg,
+                        "bot_message": bot_msg,
+                        "summary": turn_summary
+                    }
+                    
+                    interactions.append(interaction)
+                    
+                except Exception as e:
+                    print(Fore.YELLOW + f"Warning: Could not parse turn {turn_num}: {e}", Fore.RESET)
+                    continue
             
             self._all_interactions = interactions
             self.turn_counter = max([i['turn'] for i in interactions]) if interactions else 0
+            self._last_saved_turn = self.turn_counter  # Track what's already saved
             
             print(Fore.GREEN + f"✓ Loaded {len(interactions)} interactions from file (returning user)", Fore.RESET)
             print(Fore.CYAN + f"  Last updated: {last_updated}", Fore.RESET)
@@ -639,6 +1204,7 @@ Your summary:
             traceback.print_exc()
             self._all_interactions = []
             self.turn_counter = 0
+            self._last_saved_turn = 0
             return False
 
 
