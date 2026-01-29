@@ -16,6 +16,22 @@ from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from agent_memory import MemoryOps
 
 
+def format_username(name: str) -> str:
+    """Convert username to lowercase with spaces replaced by underscores.
+    
+    Args:
+        name: The username to format (e.g., "Zenodia Charpy")
+    
+    Returns:
+        Formatted username (e.g., "zenodia_charpy")
+    
+    Example:
+        >>> format_username("Zenodia Charpy")
+        'zenodia_charpy'
+    """
+    return name.lower().replace(" ", "_")
+
+
 def generate_conversation_topics():
     """Generate 100 diverse conversation topics and responses."""
     conversations = []
