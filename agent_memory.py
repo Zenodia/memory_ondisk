@@ -47,12 +47,12 @@ PERIOD_META: Dict[PeriodType, PeriodMeta] = {
 - did you notice anything odd?
 - what information should be remembered for the rest of the day? week? month? year?
 
-Since tools are stateful (aka the `sms_list` tool will show previous SMS interactions, make sure to only summarize content taken based on the NEW information from the tools.
+Since tool calls might have several repeated calls, make sure to only summarize content taken based on the NEW information from the tools.
 """,
         time_period="just now",
         example="""
-- I just sent a text message to Sarah about meeting up for coffee tomorrow at 3pm.
-- Received an email from my boss about the Q4 report deadline being moved to next Friday.
+- Book myself for 2 hours between 10-11 on Friday to learn this topic.
+- I just upload an image, can you summarize the content and integrate into the study material as supplement?
 """
     ),
     PeriodType.DAILY: PeriodMeta(
@@ -66,9 +66,10 @@ Since tools are stateful (aka the `sms_list` tool will show previous SMS interac
 """,
         time_period="today",
         example="""
-- Today I had three meetings with clients, finished the presentation for Friday's demo, and started outlining the new project proposal.
-- Noticed that the coffee machine is broken again - need to remind facilities.
-- Made good progress on my fitness goal by completing a 5k run.
+- I studied hard for driving test today, I even watched video on youtube to learn more about practice driving, however when I took the quiz, I don't feel confident on the answers I gave.
+- Noticed that I completed the first sub topic of the lesson, I feel like I reached a milestone, although there are many more to go, I hope I won't forget about what I learned.
+- I find my understanding of how to build a robust agentic system is superficial, I wonder where can I find more info to quickly grasp the key concepts?
+- I feedback on the UI today, the AI assistant is behaving strangely, I asked for a youtube link related to the topic, but it gave me a video which has nothing to do with the topic. 
 """
     ),
     PeriodType.WEEKLY: PeriodMeta(
@@ -83,9 +84,9 @@ Since tools are stateful (aka the `sms_list` tool will show previous SMS interac
 """,
         time_period="this week",
         example="""
-- This week, I conducted three productive sessions with Sarah focusing on algebra and geometry. She demonstrated significant improvement in solving quadratic equations and showed particular strength in geometric proofs. Her confidence has grown noticeably, especially when tackling complex word problems.
+- This week, I conducted three productive sessions with Sarah focusing on algebra and geometry. She demonstrated significant improvement in solving quadratic equations.
 - During our Thursday session, I noticed Sarah's problem-solving speed has increased by about 40%. Based on this progress, I've decided to introduce more challenging practice problems and implement a structured review system to reinforce these concepts.
-- I've attempted to contact Michael three times this week to schedule our next session. After reviewing our last interaction where he expressed scheduling conflicts, I'll pause outreach efforts and wait for him to initiate contact when his schedule permits.
+- Michael scheduled 3 study sessions this week, but his progress is minimal. After reviewing our last interaction where he expressed conflicts in scheduling with his current work for 2 more weeks, I will wait him to contact me when he is free.
 """
     ),
 }
@@ -165,7 +166,7 @@ class MemoryHandler:
         self._all_interactions = []  # Store raw interactions for text file
         
         # Create memory extraction chain with Orin-style prompt
-        memory_extract_prompt = """You are Orin, an AI tutor, creating your own memory summary from {time_period}. Write in FIRST PERSON ("I worked with...", "My student showed...").
+        memory_extract_prompt = """You are Ollie, an AI tutor, creating your own memory summary from {time_period}. Write in FIRST PERSON ("I worked with...", "My student showed...").
 
 Keep your summary to {max_length} maximum.
 

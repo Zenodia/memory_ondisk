@@ -134,11 +134,12 @@ async def demo_blocking_vs_nonblocking():
     )
     
     # Test blocking mode
+    
     print("\n🔴 BLOCKING MODE:")
     memory_ops_blocking = MemoryOps(
-        username="demo_blocking",
+        username="nick",
         llm=llm,
-        memory_dir="./demo_memory_blocking",
+        memory_dir="./nick_mem",
         rate_limit_delay=0.5,
         summary_interval=1  # Summarize every turn for comparison
     )
@@ -156,9 +157,9 @@ async def demo_blocking_vs_nonblocking():
     # Test non-blocking mode
     print("\n🟢 NON-BLOCKING MODE:")
     memory_ops_nonblocking = MemoryOps(
-        username="demo_nonblocking",
+        username="nick",
         llm=llm,
-        memory_dir="./demo_memory_nonblocking",
+        memory_dir="./nick_mem",
         rate_limit_delay=0.5,
         summary_interval=1  # Summarize every turn for comparison
     )
@@ -190,7 +191,7 @@ async def main():
         return
     
     # Run demos
-    await demo_blocking_vs_nonblocking()
+    #await demo_blocking_vs_nonblocking()
     await demo_nonblocking_conversation()
 
 
